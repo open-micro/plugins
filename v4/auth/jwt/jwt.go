@@ -25,13 +25,13 @@ func NewRules() auth.Rules {
 }
 
 type jwt struct {
-	sync.Mutex
+	sync.RWMutex
 	options auth.Options
 	jwt     jwtToken.Provider
 }
 
 type jwtRules struct {
-	sync.Mutex
+	sync.RWMutex
 	rules []*auth.Rule
 }
 
@@ -54,8 +54,9 @@ func (j *jwt) Init(opts ...auth.Option) {
 }
 
 func (j *jwt) Options() auth.Options {
-	j.Lock()
-	defer j.Unlock()
+	j.RLock()
+	defer j.RUnlock()
+
 	return j.options
 }
 
@@ -84,6 +85,7 @@ func (j *jwt) Generate(id string, opts ...auth.GenerateOption) (*auth.Account, e
 func (j *jwtRules) Grant(rule *auth.Rule) error {
 	j.Lock()
 	defer j.Unlock()
+
 	j.rules = append(j.rules, rule)
 	return nil
 }
@@ -104,20 +106,16 @@ func (j *jwtRules) Revoke(rule *auth.Rule) error {
 }
 
 func (j *jwtRules) Verify(acc *auth.Account, res *auth.Resource, opts ...auth.VerifyOption) error {
-	j.Lock()
-	defer j.Unlock()
-
-	var options auth.VerifyOptions
-	for _, o := range opts {
-		o(&options)
-	}
+	j.RLock()
+	defer j.RUnlock()
 
 	return auth.Verify(j.rules, acc, res)
 }
 
 func (j *jwtRules) List(opts ...auth.ListOption) ([]*auth.Rule, error) {
-	j.Lock()
-	defer j.Unlock()
+	j.RLock()
+	defer j.RUnlock()
+
 	return j.rules, nil
 }
 
