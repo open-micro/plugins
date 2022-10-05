@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/go-micro/plugins/v4/transport/http2/ringbuffer"
 	"go-micro.dev/v4/logger"
@@ -34,6 +35,8 @@ type Http2Server struct {
 	tlsConfig *tls.Config
 	addr      string
 	listener  net.Listener
+
+	bufrb ringbuffer.RingBuffer[[]byte]
 }
 
 func (s *Http2Server) Listen(addr string, lopts transport.ListenOptions) error {
@@ -103,19 +106,19 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		// if r.Method != http.MethodPost {
-		// 	w.WriteHeader(http.StatusBadRequest)
-		// 	return
-		// }
-		// if _, ok := w.(http.Flusher); !ok {
-		// 	w.WriteHeader(http.StatusBadRequest)
-		// 	return
-		// }
+		if r.Method != http.MethodPost {
+			s.options.Logger.Log(logger.ErrorLevel, "Not a post?")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if _, ok := w.(http.Flusher); !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 
 		bufr := bufio.NewReader(r.Body)
 
-		rb, _ := ringbuffer.CreateBuffer[*transport.Message](256, 1)
-		rbc, _ := rb.CreateConsumer()
+		rb, _ := ringbuffer.CreateBuffer[*transport.Message](256, 10)
 
 		h2Conn := &Http2Conn{
 			options: s.options,
@@ -125,9 +128,7 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 			buf:     make([]byte, 4*1024*1024),
 			bufr:    bufr,
 			rb:      rb,
-			rbc:     rbc,
 		}
-		rb.Write(&transport.Message{})
 
 		acceptor(h2Conn)
 	})
@@ -160,9 +161,12 @@ type Http2Conn struct {
 	w       http.ResponseWriter
 
 	closed bool
+	once   sync.Once
 
 	buf  []byte
 	bufr *bufio.Reader
+
+	ringbuffer.RingBuffer[[]byte]
 
 	rb  ringbuffer.RingBuffer[*transport.Message]
 	rbc ringbuffer.Consumer[*transport.Message]
@@ -185,11 +189,13 @@ func (s *Http2Conn) readMessage(msg *transport.Message) error {
 
 	msg.Header[":path"] = s.r.URL.Path
 
+	s.options.Logger.Logf(logger.TraceLevel, "ContentLength: %d", s.r.ContentLength)
+
 	n, err := s.bufr.Read(s.buf)
 	msg.Body = s.buf[:n]
 	if err != nil {
 		if err == io.EOF {
-			s.options.Logger.Log(logger.ErrorLevel, "read eof")
+			s.options.Logger.Log(logger.TraceLevel, "read eof")
 			return nil
 		}
 		s.options.Logger.Log(logger.ErrorLevel, err)
@@ -211,8 +217,8 @@ func (s *Http2Conn) writeMessage(msg *transport.Message) error {
 	_, err := s.w.Write(msg.Body)
 	if err != nil {
 		if err == io.EOF {
-			s.options.Logger.Log(logger.ErrorLevel, "write eof")
-			return io.EOF
+			s.options.Logger.Log(logger.TraceLevel, "write eof")
+			return nil
 		}
 
 		s.options.Logger.Log(logger.ErrorLevel, err)
@@ -235,17 +241,37 @@ func (s *Http2Conn) Recv(msg *transport.Message) error {
 		return io.EOF
 	}
 
-	if err := s.readMessage(msg); err != nil {
+	var (
+		err  error
+		once = false
+	)
+	s.once.Do(func() {
+		s.rbc, _ = s.rb.CreateConsumer()
+		if err2 := s.readMessage(msg); err2 != nil {
+			once = true
+			err = err2
+		}
+		once = true
+	})
+	if err != nil || once {
 		return err
 	}
 
 	s.options.Logger.Log(logger.TraceLevel, "wait ringbuffer")
 	wMsg := s.rbc.Get()
 	s.options.Logger.Log(logger.TraceLevel, "waited ringbuffer")
-	if len(wMsg.Body) > 0 {
+
+	if wMsg != nil {
 		if err := s.writeMessage(wMsg); err != nil {
 			return err
 		}
+
+		if err := s.readMessage(msg); err != nil {
+			return err
+		}
+	} else {
+		s.options.Logger.Log(logger.TraceLevel, "write message is nil")
+		return fmt.Errorf("no message to send")
 	}
 
 	return nil
@@ -260,13 +286,14 @@ func (s *Http2Conn) Send(msg *transport.Message) error {
 		return io.EOF
 	}
 
+	s.options.Logger.Log(logger.TraceLevel, "have something to send")
 	s.rb.Write(msg)
 
 	return nil
 }
 
 func (s *Http2Conn) Close() error {
-	logger.Info("closing")
+	s.options.Logger.Log(logger.TraceLevel, "closing")
 	s.r.Body.Close()
 	s.rb.Write(nil)
 	s.closed = true

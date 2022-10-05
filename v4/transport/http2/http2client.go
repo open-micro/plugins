@@ -2,8 +2,10 @@ package http2
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 
@@ -49,7 +51,7 @@ func (c *Http2Client) Dial() error {
 		},
 	}}
 
-	c.rb, _ = ringbuffer.CreateBuffer[*http.Request](256, 1)
+	c.rb, _ = ringbuffer.CreateBuffer[*http.Request](256, 10)
 	c.buf = make([]byte, 4*1024*1024)
 	c.rbc, _ = c.rb.CreateConsumer()
 
@@ -69,7 +71,7 @@ func (c *Http2Client) Send(msg *transport.Message) error {
 
 	httpReq := &http.Request{
 		Proto:  "HTTP/2.0",
-		Method: http.MethodGet,
+		Method: http.MethodPost,
 		URL: &url.URL{
 			Scheme: "https",
 			Host:   c.addr,
@@ -77,6 +79,7 @@ func (c *Http2Client) Send(msg *transport.Message) error {
 		},
 		Header:        header,
 		ContentLength: int64(len(msg.Body)),
+		Body:          io.NopCloser(bytes.NewReader(msg.Body)),
 	}
 
 	c.rb.Write(httpReq)
@@ -105,6 +108,9 @@ func (c *Http2Client) Recv(msg *transport.Message) error {
 	bufr := bufio.NewReader(resp.Body)
 	n, err := bufr.Read(c.buf)
 	msg.Body = c.buf[:n]
+	// if err := resp.Body.Close(); err != nil {
+	// 	return errors.New("go.micro.transport.http", err.Error(), http.StatusInternalServerError)
+	// }
 	if msg.Header == nil {
 		msg.Header = make(map[string]string, len(resp.Header))
 	}
