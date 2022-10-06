@@ -1,8 +1,11 @@
+// Parts of this are stolen from:
+// https://github.com/posener/h2conn/blob/master/server.go
+
 package http2
 
 import (
-	"bufio"
 	"crypto/tls"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +23,24 @@ import (
 	mls "go-micro.dev/v4/util/tls"
 )
 
+type flushWrite struct {
+	W io.Writer
+	F http.Flusher
+}
+
+func (w *flushWrite) Write(data []byte) (int, error) {
+	n, err := w.W.Write(data)
+	w.F.Flush()
+	return n, err
+}
+
+func (w *flushWrite) Close() error {
+	// Currently server side close of connection is not supported in Go.
+	// The server closes the connection when the http.Handler function returns.
+	// We use connection context and cancel function as a work-around.
+	return nil
+}
+
 func newHttp2Server(addr string, options *transport.Options, lopts transport.ListenOptions) (*Http2Server, error) {
 	s := &Http2Server{options: options}
 
@@ -35,8 +56,6 @@ type Http2Server struct {
 	tlsConfig *tls.Config
 	addr      string
 	listener  net.Listener
-
-	bufrb ringbuffer.RingBuffer[[]byte]
 }
 
 func (s *Http2Server) Listen(addr string, lopts transport.ListenOptions) error {
@@ -102,32 +121,30 @@ func (s *Http2Server) Close() error {
 
 func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor != 2 {
-			w.WriteHeader(http.StatusBadRequest)
-			return
+		if !r.ProtoAtLeast(2, 0) {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}
-		if r.Method != http.MethodPost {
-			s.options.Logger.Log(logger.ErrorLevel, "Not a post?")
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if _, ok := w.(http.Flusher); !ok {
-			w.WriteHeader(http.StatusBadRequest)
-			return
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}
 
-		bufr := bufio.NewReader(r.Body)
+		flushWrite := &flushWrite{W: w, F: flusher}
 
-		rb, _ := ringbuffer.CreateBuffer[*transport.Message](256, 10)
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		rb, _ := ringbuffer.CreateBuffer[*transport.Message](16, 1)
 
 		h2Conn := &Http2Conn{
 			options: s.options,
 			local:   s.addr,
-			r:       r,
-			w:       w,
 			buf:     make([]byte, 4*1024*1024),
-			bufr:    bufr,
+			r:       r,
+			w:       flushWrite,
 			rb:      rb,
+			encoder: gob.NewEncoder(flushWrite),
+			decoder: gob.NewDecoder(r.Body),
 		}
 
 		acceptor(h2Conn)
@@ -136,6 +153,7 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 	server2 := &http2.Server{}
 	for {
 		conn, err := s.listener.Accept()
+
 		switch conn.(type) {
 		case *tls.Conn:
 			if err := conn.(*tls.Conn).Handshake(); err != nil {
@@ -156,51 +174,26 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 
 type Http2Conn struct {
 	options *transport.Options
+	once    sync.Once
 	local   string
 	r       *http.Request
-	w       http.ResponseWriter
-
-	closed bool
-	once   sync.Once
-
-	buf  []byte
-	bufr *bufio.Reader
-
-	ringbuffer.RingBuffer[[]byte]
-
-	rb  ringbuffer.RingBuffer[*transport.Message]
-	rbc ringbuffer.Consumer[*transport.Message]
+	w       io.WriteCloser
+	buf     []byte
+	rb      ringbuffer.RingBuffer[*transport.Message]
+	rbc     ringbuffer.Consumer[*transport.Message]
+	encoder *gob.Encoder
+	decoder *gob.Decoder
 }
 
 func (s *Http2Conn) readMessage(msg *transport.Message) error {
 	s.options.Logger.Log(logger.TraceLevel, "readmessage")
 
-	// Read request
-	if msg.Header == nil {
-		msg.Header = make(map[string]string, len(s.r.Header))
-	}
-	for k, v := range s.r.Header {
-		if len(v) > 0 {
-			msg.Header[k] = v[0]
-		} else {
-			msg.Header[k] = ""
-		}
-	}
-
-	msg.Header[":path"] = s.r.URL.Path
-
-	s.options.Logger.Logf(logger.TraceLevel, "ContentLength: %d", s.r.ContentLength)
-
-	n, err := s.bufr.Read(s.buf)
-	msg.Body = s.buf[:n]
-	if err != nil {
-		if err == io.EOF {
-			s.options.Logger.Log(logger.TraceLevel, "read eof")
-			return nil
-		}
+	if err := s.decoder.Decode(msg); err != nil {
 		s.options.Logger.Log(logger.ErrorLevel, err)
 		return err
 	}
+
+	msg.Header[":path"] = s.r.URL.Path
 
 	s.options.Logger.Log(logger.TraceLevel, "readmessage done")
 
@@ -209,24 +202,11 @@ func (s *Http2Conn) readMessage(msg *transport.Message) error {
 
 func (s *Http2Conn) writeMessage(msg *transport.Message) error {
 	s.options.Logger.Log(logger.TraceLevel, "write message")
-	// Write response
-	for k, v := range msg.Header {
-		s.w.Header().Set(k, v)
-	}
 
-	_, err := s.w.Write(msg.Body)
-	if err != nil {
-		if err == io.EOF {
-			s.options.Logger.Log(logger.TraceLevel, "write eof")
-			return nil
-		}
-
+	if err := s.encoder.Encode(msg); err != nil {
 		s.options.Logger.Log(logger.ErrorLevel, err)
 		return err
 	}
-
-	// flush the trailers
-	s.w.(http.Flusher).Flush()
 
 	s.options.Logger.Log(logger.TraceLevel, "write message done")
 	return nil
@@ -235,10 +215,6 @@ func (s *Http2Conn) writeMessage(msg *transport.Message) error {
 func (s *Http2Conn) Recv(msg *transport.Message) error {
 	if msg == nil {
 		return errors.New("message passed in is nil")
-	}
-
-	if s.closed {
-		return io.EOF
 	}
 
 	var (
@@ -282,10 +258,6 @@ func (s *Http2Conn) Send(msg *transport.Message) error {
 		return errors.New("message passed in is nil")
 	}
 
-	if s.closed {
-		return io.EOF
-	}
-
 	s.options.Logger.Log(logger.TraceLevel, "have something to send")
 	s.rb.Write(msg)
 
@@ -294,10 +266,7 @@ func (s *Http2Conn) Send(msg *transport.Message) error {
 
 func (s *Http2Conn) Close() error {
 	s.options.Logger.Log(logger.TraceLevel, "closing")
-	s.r.Body.Close()
-	s.rb.Write(nil)
-	s.closed = true
-
+	s.w.Close()
 	return nil
 }
 

@@ -1,0 +1,19 @@
+GOMAXPROCS=8 /usr/bin/go test -v -benchmem -run=^$ -bench ^BenchmarkService1$ go-micro.dev/v4 
+
+http:
+BenchmarkService1-8         4916            225372 ns/op           25579 B/op        290 allocs/op
+
+http+secure:
+BenchmarkService1-8         5774            232110 ns/op           26309 B/op        319 allocs/op
+
+grpc:
+BenchmarkService1-8         9906            121745 ns/op           17837 B/op        318 allocs/op
+
+http2+h2conn:
+BenchmarkService1-8         9985            113392 ns/op           14863 B/op        229 allocs/op
+
+http2+large_rings:
+BenchmarkService1-8         8696            116976 ns/op           14866 B/op        229 allocs/op
+
+http2+very_small_rings:
+BenchmarkService1-8         9199            113689 ns/op           14866 B/op        229 allocs/op

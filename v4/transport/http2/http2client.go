@@ -1,13 +1,15 @@
+// Parts of this are stolen from
+// h2conn: https://github.com/posener/h2conn/blob/master/client.go
+
 package http2
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"crypto/tls"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 
 	"github.com/go-micro/plugins/v4/transport/http2/ringbuffer"
 	"go-micro.dev/v4/errors"
@@ -31,8 +33,13 @@ func newHttp2Client(addr string, options *transport.Options) (*Http2Client, erro
 }
 
 type Http2Client struct {
-	options *transport.Options
-	client  http.Client
+	options    *transport.Options
+	client     *http.Client
+	context    context.Context
+	cancelFunc context.CancelFunc
+
+	encoder *gob.Encoder
+	decoder *gob.Decoder
 
 	addr string
 
@@ -40,18 +47,57 @@ type Http2Client struct {
 
 	buf []byte
 
-	rb  ringbuffer.RingBuffer[*http.Request]
-	rbc ringbuffer.Consumer[*http.Request]
+	rb  ringbuffer.RingBuffer[*transport.Message]
+	rbc ringbuffer.Consumer[*transport.Message]
+}
+
+func (c *Http2Client) connect(urlStr string) error {
+	reader, writer := io.Pipe()
+
+	// Create a request object to send to the server
+	req, err := http.NewRequest(http.MethodPost, urlStr, reader)
+	if err != nil {
+		return err
+	}
+
+	// Apply given context to the sent request
+	c.context, c.cancelFunc = context.WithCancel(context.Background())
+	req = req.WithContext(c.context)
+
+	// Perform the request
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	// Check server status code
+	if resp.StatusCode != http.StatusOK {
+		c.options.Logger.Logf(logger.ErrorLevel, "bad status code: %d", resp.StatusCode)
+		return errors.New("go.micro.transport.http2", "Bad Statuscode", int32(resp.StatusCode))
+	}
+
+	c.encoder = gob.NewEncoder(writer)
+	c.decoder = gob.NewDecoder(resp.Body)
+
+	return nil
 }
 
 func (c *Http2Client) Dial() error {
-	c.client = http.Client{Transport: &http2.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
+	c.client = &http.Client{
+		Transport: &http2.Transport{
+			DisableCompression: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
 		},
-	}}
+	}
 
-	c.rb, _ = ringbuffer.CreateBuffer[*http.Request](256, 10)
+	if err := c.connect(fmt.Sprintf("https://%s/", c.addr)); err != nil {
+		c.options.Logger.Logf(logger.ErrorLevel, "initiate conn: %s", err)
+		return err
+	}
+
+	c.rb, _ = ringbuffer.CreateBuffer[*transport.Message](16, 1)
 	c.buf = make([]byte, 4*1024*1024)
 	c.rbc, _ = c.rb.CreateConsumer()
 
@@ -63,26 +109,7 @@ func (c *Http2Client) Send(msg *transport.Message) error {
 		return errors.New("go.micro.transport.http", "message passed in is nil", http.StatusInternalServerError)
 	}
 
-	// Prepare request
-	header := make(http.Header, len(msg.Header))
-	for k, v := range msg.Header {
-		header.Set(k, v)
-	}
-
-	httpReq := &http.Request{
-		Proto:  "HTTP/2.0",
-		Method: http.MethodPost,
-		URL: &url.URL{
-			Scheme: "https",
-			Host:   c.addr,
-			Path:   "/",
-		},
-		Header:        header,
-		ContentLength: int64(len(msg.Body)),
-		Body:          io.NopCloser(bytes.NewReader(msg.Body)),
-	}
-
-	c.rb.Write(httpReq)
+	c.rb.Write(msg)
 
 	return nil
 }
@@ -95,35 +122,13 @@ func (c *Http2Client) Recv(msg *transport.Message) error {
 	req := c.rbc.Get()
 
 	// Send request
-	resp, err := c.client.Do(req)
-	if err != nil {
+	if err := c.encoder.Encode(req); err != nil {
 		logger.Error(err)
 		return fmt.Errorf("request: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return errors.New("go.micro.transport.http", resp.Status, int32(resp.StatusCode))
-	}
-
-	bufr := bufio.NewReader(resp.Body)
-	n, err := bufr.Read(c.buf)
-	msg.Body = c.buf[:n]
-	// if err := resp.Body.Close(); err != nil {
-	// 	return errors.New("go.micro.transport.http", err.Error(), http.StatusInternalServerError)
-	// }
-	if msg.Header == nil {
-		msg.Header = make(map[string]string, len(resp.Header))
-	}
-
-	for k, v := range resp.Header {
-		if len(v) > 0 {
-			msg.Header[k] = v[0]
-		} else {
-			msg.Header[k] = ""
-		}
-	}
-
-	if err != nil {
+	// Read response
+	if err := c.decoder.Decode(msg); err != nil {
 		logger.Error(err)
 		return fmt.Errorf("read: %w", err)
 	}
@@ -132,6 +137,7 @@ func (c *Http2Client) Recv(msg *transport.Message) error {
 }
 
 func (c *Http2Client) Close() error {
+	c.cancelFunc()
 	return nil
 }
 
