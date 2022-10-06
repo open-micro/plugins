@@ -45,8 +45,6 @@ type Http2Client struct {
 
 	connected bool
 
-	buf []byte
-
 	rb  ringbuffer.RingBuffer[*transport.Message]
 	rbc ringbuffer.Consumer[*transport.Message]
 }
@@ -97,8 +95,7 @@ func (c *Http2Client) Dial() error {
 		return err
 	}
 
-	c.rb, _ = ringbuffer.CreateBuffer[*transport.Message](16, 1)
-	c.buf = make([]byte, 4*1024*1024)
+	c.rb, _ = ringbuffer.CreateBuffer[*transport.Message](8, 1)
 	c.rbc, _ = c.rb.CreateConsumer()
 
 	return nil
@@ -109,7 +106,9 @@ func (c *Http2Client) Send(msg *transport.Message) error {
 		return errors.New("go.micro.transport.http", "message passed in is nil", http.StatusInternalServerError)
 	}
 
+	c.options.Logger.Log(logger.TraceLevel, "writing message")
 	c.rb.Write(msg)
+	c.options.Logger.Log(logger.TraceLevel, "writing message done")
 
 	return nil
 }
@@ -123,13 +122,13 @@ func (c *Http2Client) Recv(msg *transport.Message) error {
 
 	// Send request
 	if err := c.encoder.Encode(req); err != nil {
-		logger.Error(err)
+		c.options.Logger.Log(logger.ErrorLevel, err)
 		return fmt.Errorf("request: %w", err)
 	}
 
 	// Read response
 	if err := c.decoder.Decode(msg); err != nil {
-		logger.Error(err)
+		c.options.Logger.Log(logger.ErrorLevel, err)
 		return fmt.Errorf("read: %w", err)
 	}
 
@@ -137,6 +136,7 @@ func (c *Http2Client) Recv(msg *transport.Message) error {
 }
 
 func (c *Http2Client) Close() error {
+	c.options.Logger.Log(logger.TraceLevel, "closing")
 	c.cancelFunc()
 	return nil
 }

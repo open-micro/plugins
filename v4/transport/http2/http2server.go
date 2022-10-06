@@ -129,6 +129,8 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		}
 
+		s.options.Logger.Logf(logger.DebugLevel, "New connection from: %s", r.RemoteAddr)
+
 		flushWrite := &flushWrite{W: w, F: flusher}
 
 		w.WriteHeader(http.StatusOK)
@@ -139,7 +141,6 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 		h2Conn := &Http2Conn{
 			options: s.options,
 			local:   s.addr,
-			buf:     make([]byte, 4*1024*1024),
 			r:       r,
 			w:       flushWrite,
 			rb:      rb,
@@ -178,7 +179,6 @@ type Http2Conn struct {
 	local   string
 	r       *http.Request
 	w       io.WriteCloser
-	buf     []byte
 	rb      ringbuffer.RingBuffer[*transport.Message]
 	rbc     ringbuffer.Consumer[*transport.Message]
 	encoder *gob.Encoder
