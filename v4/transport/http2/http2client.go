@@ -6,12 +6,10 @@ package http2
 import (
 	"context"
 	"crypto/tls"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"net/http"
 
-	"github.com/go-micro/plugins/v4/transport/http2/ringbuffer"
 	"go-micro.dev/v4/errors"
 	"go-micro.dev/v4/logger"
 	"go-micro.dev/v4/transport"
@@ -20,9 +18,8 @@ import (
 
 func newHttp2Client(addr string, options *transport.Options) (*Http2Client, error) {
 	c := &Http2Client{
-		options:   options,
-		addr:      addr,
-		connected: false,
+		options: options,
+		addr:    addr,
 	}
 	err := c.Dial()
 	if err != nil {
@@ -33,20 +30,13 @@ func newHttp2Client(addr string, options *transport.Options) (*Http2Client, erro
 }
 
 type Http2Client struct {
-	options    *transport.Options
-	client     *http.Client
-	context    context.Context
-	cancelFunc context.CancelFunc
-
-	encoder *gob.Encoder
-	decoder *gob.Decoder
+	options *transport.Options
+	client  *http.Client
+	conn    *Conn
 
 	addr string
 
-	connected bool
-
-	rb  ringbuffer.RingBuffer[*transport.Message]
-	rbc ringbuffer.Consumer[*transport.Message]
+	mUnmarshaler mUnmarshaler
 }
 
 func (c *Http2Client) connect(urlStr string) error {
@@ -59,8 +49,8 @@ func (c *Http2Client) connect(urlStr string) error {
 	}
 
 	// Apply given context to the sent request
-	c.context, c.cancelFunc = context.WithCancel(context.Background())
-	req = req.WithContext(c.context)
+	ctx := context.Background()
+	req = req.WithContext(ctx)
 
 	// Perform the request
 	resp, err := c.client.Do(req)
@@ -74,8 +64,9 @@ func (c *Http2Client) connect(urlStr string) error {
 		return errors.New("go.micro.transport.http2", "Bad Statuscode", int32(resp.StatusCode))
 	}
 
-	c.encoder = gob.NewEncoder(writer)
-	c.decoder = gob.NewDecoder(resp.Body)
+	conn, ctx := newConn(req.Context(), resp.Body, writer)
+	resp.Request = req.WithContext(ctx)
+	c.conn = conn
 
 	return nil
 }
@@ -90,13 +81,14 @@ func (c *Http2Client) Dial() error {
 		},
 	}
 
+	c.options.Logger.Log(logger.DebugLevel, "connecting")
+
 	if err := c.connect(fmt.Sprintf("https://%s/", c.addr)); err != nil {
 		c.options.Logger.Logf(logger.ErrorLevel, "initiate conn: %s", err)
 		return err
 	}
 
-	c.rb, _ = ringbuffer.CreateBuffer[*transport.Message](8, 1)
-	c.rbc, _ = c.rb.CreateConsumer()
+	c.mUnmarshaler, _ = NewGobMUnmarshaler(c.conn, c.conn)
 
 	return nil
 }
@@ -106,9 +98,16 @@ func (c *Http2Client) Send(msg *transport.Message) error {
 		return errors.New("go.micro.transport.http", "message passed in is nil", http.StatusInternalServerError)
 	}
 
-	c.options.Logger.Log(logger.TraceLevel, "writing message")
-	c.rb.Write(msg)
-	c.options.Logger.Log(logger.TraceLevel, "writing message done")
+	c.options.Logger.Logf(logger.TraceLevel, "sending message")
+
+	// Send request
+	c.options.Logger.Log(logger.TraceLevel, "writing")
+	err := c.mUnmarshaler.Marshal(msg)
+	if err != nil {
+		c.options.Logger.Log(logger.ErrorLevel, err)
+		return err
+	}
+	c.options.Logger.Log(logger.TraceLevel, "writing done")
 
 	return nil
 }
@@ -118,26 +117,20 @@ func (c *Http2Client) Recv(msg *transport.Message) error {
 		return errors.New("go.micro.transport.http", "message passed in is nil", http.StatusInternalServerError)
 	}
 
-	req := c.rbc.Get()
-
-	// Send request
-	if err := c.encoder.Encode(req); err != nil {
-		c.options.Logger.Log(logger.ErrorLevel, err)
-		return fmt.Errorf("request: %w", err)
-	}
-
 	// Read response
-	if err := c.decoder.Decode(msg); err != nil {
+	c.options.Logger.Log(logger.TraceLevel, "reading")
+	if err := c.mUnmarshaler.Unmarshal(msg); err != nil {
 		c.options.Logger.Log(logger.ErrorLevel, err)
-		return fmt.Errorf("read: %w", err)
+		return err
 	}
+	c.options.Logger.Log(logger.TraceLevel, "reading done")
 
 	return nil
 }
 
 func (c *Http2Client) Close() error {
 	c.options.Logger.Log(logger.TraceLevel, "closing")
-	c.cancelFunc()
+	c.conn.Close()
 	return nil
 }
 

@@ -5,15 +5,12 @@ package http2
 
 import (
 	"crypto/tls"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"sync"
 
-	"github.com/go-micro/plugins/v4/transport/http2/ringbuffer"
 	"go-micro.dev/v4/logger"
 	"go-micro.dev/v4/transport"
 	"golang.org/x/net/http2"
@@ -131,21 +128,23 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 
 		s.options.Logger.Logf(logger.DebugLevel, "New connection from: %s", r.RemoteAddr)
 
-		flushWrite := &flushWrite{W: w, F: flusher}
+		c, ctx := newConn(r.Context(), r.Body, &flushWrite{W: w, F: flusher})
+
+		// Update the request context with the connection context.
+		// If the connection is closed by the server, it will also notify everything that waits on the request context.
+		*r = *r.WithContext(ctx)
 
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 
-		rb, _ := ringbuffer.CreateBuffer[*transport.Message](16, 1)
+		mu, _ := NewGobMUnmarshaler(c, c)
 
 		h2Conn := &Http2Conn{
-			options: s.options,
-			local:   s.addr,
-			r:       r,
-			w:       flushWrite,
-			rb:      rb,
-			encoder: gob.NewEncoder(flushWrite),
-			decoder: gob.NewDecoder(r.Body),
+			options:      s.options,
+			local:        s.addr,
+			r:            r,
+			conn:         c,
+			mUnarmshaler: mu,
 		}
 
 		acceptor(h2Conn)
@@ -154,61 +153,60 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 	server2 := &http2.Server{}
 	for {
 		conn, err := s.listener.Accept()
-
-		switch conn.(type) {
-		case *tls.Conn:
-			if err := conn.(*tls.Conn).Handshake(); err != nil {
-				fmt.Println(err)
-				continue
-			}
-		}
-
 		if err != nil {
 			return err
 		}
 
-		server2.ServeConn(conn, &http2.ServeConnOpts{
-			Handler: handler,
-		})
+		go func(conn net.Conn) {
+			switch conn.(type) {
+			case *tls.Conn:
+				if err := conn.(*tls.Conn).Handshake(); err != nil {
+					return
+				}
+			}
+
+			server2.ServeConn(conn, &http2.ServeConnOpts{
+				Handler: handler,
+			})
+		}(conn)
 	}
 }
 
 type Http2Conn struct {
 	options *transport.Options
-	once    sync.Once
 	local   string
 	r       *http.Request
-	w       io.WriteCloser
-	rb      ringbuffer.RingBuffer[*transport.Message]
-	rbc     ringbuffer.Consumer[*transport.Message]
-	encoder *gob.Encoder
-	decoder *gob.Decoder
+	conn    *Conn
+
+	mUnarmshaler mUnmarshaler
 }
 
 func (s *Http2Conn) readMessage(msg *transport.Message) error {
-	s.options.Logger.Log(logger.TraceLevel, "readmessage")
+	s.options.Logger.Logf(logger.TraceLevel, "readmessage for: %s", s.Remote())
 
-	if err := s.decoder.Decode(msg); err != nil {
+	err := s.mUnarmshaler.Unmarshal(msg)
+	if err != nil {
 		s.options.Logger.Log(logger.ErrorLevel, err)
 		return err
 	}
 
 	msg.Header[":path"] = s.r.URL.Path
 
-	s.options.Logger.Log(logger.TraceLevel, "readmessage done")
+	s.options.Logger.Logf(logger.TraceLevel, "readmessage done, for: %s", s.Remote())
 
 	return nil
 }
 
 func (s *Http2Conn) writeMessage(msg *transport.Message) error {
-	s.options.Logger.Log(logger.TraceLevel, "write message")
+	s.options.Logger.Logf(logger.TraceLevel, "[%s] writemessage", s.Remote())
 
-	if err := s.encoder.Encode(msg); err != nil {
+	err := s.mUnarmshaler.Marshal(msg)
+	if err != nil {
 		s.options.Logger.Log(logger.ErrorLevel, err)
 		return err
 	}
 
-	s.options.Logger.Log(logger.TraceLevel, "write message done")
+	s.options.Logger.Logf(logger.TraceLevel, "[%s] writemessage done", s.Remote())
 	return nil
 }
 
@@ -217,40 +215,7 @@ func (s *Http2Conn) Recv(msg *transport.Message) error {
 		return errors.New("message passed in is nil")
 	}
 
-	var (
-		err  error
-		once = false
-	)
-	s.once.Do(func() {
-		s.rbc, _ = s.rb.CreateConsumer()
-		if err2 := s.readMessage(msg); err2 != nil {
-			once = true
-			err = err2
-		}
-		once = true
-	})
-	if err != nil || once {
-		return err
-	}
-
-	s.options.Logger.Log(logger.TraceLevel, "wait ringbuffer")
-	wMsg := s.rbc.Get()
-	s.options.Logger.Log(logger.TraceLevel, "waited ringbuffer")
-
-	if wMsg != nil {
-		if err := s.writeMessage(wMsg); err != nil {
-			return err
-		}
-
-		if err := s.readMessage(msg); err != nil {
-			return err
-		}
-	} else {
-		s.options.Logger.Log(logger.TraceLevel, "write message is nil")
-		return fmt.Errorf("no message to send")
-	}
-
-	return nil
+	return s.readMessage(msg)
 }
 
 func (s *Http2Conn) Send(msg *transport.Message) error {
@@ -258,15 +223,16 @@ func (s *Http2Conn) Send(msg *transport.Message) error {
 		return errors.New("message passed in is nil")
 	}
 
-	s.options.Logger.Log(logger.TraceLevel, "have something to send")
-	s.rb.Write(msg)
+	if err := s.writeMessage(msg); err != nil {
+		return err
+	}
 
-	return nil
+	return s.writeMessage(msg)
 }
 
 func (s *Http2Conn) Close() error {
 	s.options.Logger.Log(logger.TraceLevel, "closing")
-	s.w.Close()
+	s.conn.Close()
 	return nil
 }
 
