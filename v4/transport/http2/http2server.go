@@ -120,10 +120,12 @@ func (s *Http2Server) Accept(acceptor func(transport.Socket)) error {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !r.ProtoAtLeast(2, 0) {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
 		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
 		}
 
 		s.options.Logger.Logf(logger.DebugLevel, "New connection from: %s", r.RemoteAddr)
@@ -186,6 +188,10 @@ func (s *Http2Conn) readMessage(msg *transport.Message) error {
 
 	err := s.mUnarmshaler.Unmarshal(msg)
 	if err != nil {
+		if err == io.EOF {
+			return nil
+		}
+
 		s.options.Logger.Log(logger.ErrorLevel, err)
 		return err
 	}
