@@ -1,0 +1,4 @@
+github.com/go-micro/go-bson v1.0.0 h1:HA0CYa9szLy8/LX1M/4Ye9HQvI4Gz1HxVIM5RWWo1T0=
+github.com/go-micro/go-bson v1.0.0/go.mod h1:p7wClOWTgO7XlpEE3VC8O4w94VQ0W+HeHrEp4xDwYVA=
+go-micro.org/v5 v5.0.1 h1:sGc+vmcIqgko5sEbAMkbMEFiqlYPBP1aQXqNyf+CMsw=
+go-micro.org/v5 v5.0.1/go.mod h1:2TYLgjrDemtqaZqN1SE71EWdw8rKlBQ0xv1r75YB/v8=
